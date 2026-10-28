@@ -1,0 +1,151 @@
+name: pr-benchmarks
+
+on:
+  repository_dispatch:
+    types: [numba-pr-benchmark]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "numba pull request number (used for the result comment)"
+        required: false
+      repo:
+        description: "numba repository to install (owner/name)"
+        default: numba/numba
+      sha:
+        description: "numba commit SHA to benchmark (default: main)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  BASELINE_BRANCH: bench-baseline
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.target.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve the numba revision to benchmark
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          if os.environ["EVENT"] == "repository_dispatch":
+              payload = json.loads(os.environ.get("PAYLOAD") or "{}")
+              repo = payload.get("repo") or "numba/numba"
+              sha = payload.get("sha") or "main"
+              pr = str(payload.get("pr") or "")
+          else:
+              repo = os.environ.get("INPUT_REPO") or "numba/numba"
+              sha = os.environ.get("INPUT_SHA") or "main"
+              pr = os.environ.get("INPUT_PR") or ""
+          print(f"repo={repo}")
+          print(f"sha={sha}")
+          print(f"pr={pr}")
+          PY
+
+      - name: Install NumPy
+        run: |
+          python -m pip install --upgrade pip numpy
+
+      - name: Install numba from ${{ steps.target.outputs.repo }}@${{ steps.target.outputs.sha }}
+        env:
+          NUMBA_REPO: ${{ steps.target.outputs.repo }}
+          NUMBA_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          python -m pip install "git+https://github.com/${NUMBA_REPO}.git@${NUMBA_SHA}"
+          python -c "import numba; print('numba', numba.__version__, numba.__file__)"
+
+      - name: Restore the nightly baseline
+        run: |
+          mkdir -p bench/_run
+          if git fetch origin "$BASELINE_BRANCH" --depth=1; then
+            git show "FETCH_HEAD:baseline.json" > bench/_run/baseline.json || true
+          fi
+
+      - name: Run benchmarks
+        run: python bench/run.py --out bench/_run/results.json
+
+      - name: Compare against the baseline
+        id: compare
+        run: |
+          set +e
+          python bench/compare.py \
+            --current bench/_run/results.json \
+            --baseline bench/_run/baseline.json \
+            --out regressions.md
+          echo "regressed=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### NumPy vs Numba benchmarks"
+            echo
+            echo "Target: \`${{ steps.target.outputs.repo }}@${{ steps.target.outputs.sha }}\`"
+            echo
+            if [ -f regressions.md ]; then
+              cat regressions.md
+            else
+              echo "No comparison produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-benchmark-results
+          path: |
+            bench/_run/results.json
+            regressions.md
+          if-no-files-found: warn
+
+  comment:
+    needs: benchmark
+    if: always() && needs.benchmark.result == 'success' && needs.benchmark.outputs.pr != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-benchmark-results
+          path: results
+
+      - name: Comment on the numba pull request
+        env:
+          GH_TOKEN: ${{ secrets.BENCH_COMMENT_TOKEN }}
+          PR: ${{ needs.benchmark.outputs.pr }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::BENCH_COMMENT_TOKEN is not set; results stay in the run summary and artifact."
+            exit 0
+          fi
+          if [ ! -f results/regressions.md ]; then
+            echo "::warning::No comparison report to post."
+            exit 0
+          fi
+          {
+            echo "## NumPy vs Numba benchmark results"
+            echo
+            echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            cat results/regressions.md
+          } > comment.md
+          gh pr comment "$PR" --repo numba/numba --body-file comment.md

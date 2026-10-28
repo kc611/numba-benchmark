@@ -39,3 +39,27 @@ on merges to `main`. It:
 The first run seeds the baseline (no comparison). Thresholds live in
 `bench/compare.py` (`--threshold`). Add an operation by adding a
 `(name, numpy_fn, numba_fn)` tuple in `bench/run.py:build_pairs()`.
+
+## Run on a numba pull request
+
+Adding the **`benchmark`** label to a pull request in `numba/numba` dispatches
+`.github/workflows/pr-benchmarks.yml` here. It installs numba from the pull
+request's head commit, runs the benchmarks against the nightly baseline, uploads
+the results as an artifact, and (if configured) comments the report on the PR.
+
+The label is handled by `.github/workflows/benchmark-label.yml` in `numba/numba`,
+which only sends a `repository_dispatch`; it never checks out or runs pull
+request code. One-time setup:
+
+1. Create the `benchmark` label in `numba/numba`.
+2. Add a `BENCHMARK_DISPATCH_TOKEN` secret to `numba/numba`: a token with
+   **Actions: write** on `numba/numba-benchmark`.
+3. Optional: add a `BENCH_COMMENT_TOKEN` secret here, a token with
+   **Pull requests: write** on `numba/numba`, to post the report on the PR.
+   Without it the report stays in the run summary and the artifact.
+
+The workflow must be on this repository's default branch for
+`repository_dispatch` to reach it, and the numba-side workflow must be on
+`numba/numba`'s default branch for the label event to fire. Re-adding the label
+starts a new run.
+
