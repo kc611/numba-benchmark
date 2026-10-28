@@ -4,9 +4,7 @@
 *.dylib
 *.pyd
 *.pdb
-html/
-env/
-numba/
-results/
 __pycache__
-
+bench/_run/
+regressions.md
+baseline.json

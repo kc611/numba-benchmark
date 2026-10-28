@@ -1,0 +1,97 @@
+name: nightly-benchmarks
+
+on:
+  schedule:
+    # Single run mode: once a night to stay within the GitHub Actions budget.
+    # Not run on merges to main.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-benchmarks
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  BASELINE_BRANCH: bench-baseline
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install numba from main
+        run: |
+          python -m pip install -U pip
+          python -m pip install numpy
+          python -m pip install "git+https://github.com/numba/numba.git@main"
+          python -c "import numba; print('numba', numba.__version__)"
+
+      - name: Restore baseline
+        run: |
+          mkdir -p bench/_run
+          if git fetch origin "$BASELINE_BRANCH" --depth=1 2>/dev/null; then
+            git show "FETCH_HEAD:baseline.json" > bench/_run/baseline.json 2>/dev/null || true
+          fi
+          ls -l bench/_run || true
+
+      - name: Run benchmarks
+        run: python bench/run.py --out bench/_run/results.json
+
+      - name: Compare against baseline
+        id: compare
+        run: |
+          set +e
+          python bench/compare.py \
+            --current bench/_run/results.json \
+            --baseline bench/_run/baseline.json \
+            --out regressions.md
+          echo "regressed=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-benchmark-results
+          path: |
+            bench/_run/results.json
+            regressions.md
+          if-no-files-found: warn
+
+      - name: Advance baseline
+        if: always()
+        run: |
+          set -e
+          pub="$(mktemp -d)"
+          cp bench/_run/results.json "$pub/baseline.json"
+          cd "$pub"
+          git init -q
+          git checkout -q -b "$BASELINE_BRANCH"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add baseline.json
+          git commit -q -m "nightly baseline $(date -u +%Y-%m-%d)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "$BASELINE_BRANCH"
+
+      - name: Open or update regression issue
+        if: steps.compare.outputs.regressed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Nightly benchmark regression"
+          body="$(cat regressions.md)"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
